@@ -135,7 +135,23 @@ def refresh_stats():
         f"**Последний запрос**: {kpis['last_timestamp']}"
     )
 
-    df = pd.DataFrame(records[-200:])
+    rows = []
+    for r in records[-200:]:
+        input_type = r.get("input_type")
+        ships = r.get("ship_count") if input_type == "image" else r.get("ship_count_max")
+        rows.append(
+            {
+                "timestamp": r.get("timestamp"),
+                "id": r.get("id"),
+                "input_type": input_type,
+                "source": r.get("source"),
+                "ships": ships,
+                "processing_ms": r.get("processing_ms"),
+                "model_weights": r.get("model_weights"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
     return md, fig_time, fig_hist, df
 
 
