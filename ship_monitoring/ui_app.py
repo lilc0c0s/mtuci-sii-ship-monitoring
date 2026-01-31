@@ -6,12 +6,12 @@ from typing import Any
 import gradio as gr
 import pandas as pd
 
-from .config import DEFAULT_MODEL_WEIGHTS, DEFAULT_TARGET_CLASS_NAMES
+from .config import DEFAULT_MODEL_WEIGHTS, DEFAULT_TARGET_CLASS_NAMES, UPLOADS_DIR, ensure_runtime_dirs
 from .history import append_record, load_history
 from .inference import predict_image, predict_video
 from .reports import export_excel, export_pdf, export_summary_excel, export_summary_pdf
 from .stats import compute_kpis, make_figures
-from .utils import download_image
+from .utils import download_image, new_id
 
 
 MODEL_PRESETS = [
@@ -37,6 +37,194 @@ def _as_video_path(video_value: Any) -> str | None:
         return video_value.get("name") or video_value.get("path")
 
     return str(video_value)
+
+
+
+def _parse_camera_source(src: str) -> int | str:
+    s = (src or "").strip()
+    if not s:
+        return 0
+    if s.isdigit():
+        return int(s)
+    return s
+
+
+def capture_frame_from_source(source: str):
+    """Берёт один кадр из источника OpenCV (камера/файл/URL) и возвращает PIL.Image."""
+
+    import cv2
+    from PIL import Image
+
+    src = _parse_camera_source(source)
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        raise gr.Error(
+            "Не удалось открыть камеру/поток. "
+            "Проверь источник (0/1/путь/URL) и разрешения на камеру в Windows."
+        )
+
+    frame = None
+    # Прогрев автоэкспозиции (актуально для реальной камеры)
+    for _ in range(8):
+        ok, f = cap.read()
+        if ok:
+            frame = f
+
+    cap.release()
+
+    if frame is None:
+        raise gr.Error("Не удалось получить кадр с камеры/потока")
+
+    rgb = frame[:, :, ::-1]
+    return Image.fromarray(rgb)
+
+
+def record_clip_from_source(source: str, *, seconds: int = 3) -> Path:
+    """Записывает короткий клип из источника OpenCV и возвращает путь к mp4."""
+
+    import cv2
+
+    ensure_runtime_dirs()
+
+    src = _parse_camera_source(source)
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        raise gr.Error(
+            "Не удалось открыть камеру/поток. "
+            "Проверь источник (0/1/путь/URL) и разрешения на камеру в Windows."
+        )
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 20
+    if fps < 1:
+        fps = 20
+
+    seconds = max(1, int(seconds))
+    frames_target = int(max(1, fps * seconds))
+
+    ok, frame0 = cap.read()
+    if not ok or frame0 is None:
+        cap.release()
+        raise gr.Error("Не удалось прочитать кадры из источника")
+
+    h, w = frame0.shape[:2]
+
+    clip_id = new_id()
+    out_path = UPLOADS_DIR / f"camera_clip_{clip_id}.mp4"
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (int(w), int(h)))
+    if not writer.isOpened():
+        cap.release()
+        raise gr.Error("Не удалось инициализировать запись mp4 (VideoWriter)")
+
+    writer.write(frame0)
+    written = 1
+
+    while written < frames_target:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+
+        if frame.shape[0] != h or frame.shape[1] != w:
+            frame = cv2.resize(frame, (w, h))
+
+        writer.write(frame)
+        written += 1
+
+    cap.release()
+    writer.release()
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise gr.Error("Не удалось записать клип")
+
+    return out_path
+
+
+def run_webcam_image(
+    image,
+    weights_preset: str,
+    weights_custom: str,
+    conf: float,
+    iou: float,
+    imgsz: int,
+    draw_only_target: bool,
+):
+    if image is None:
+        raise gr.Error("Разреши доступ к камере и сделай снимок, затем запусти детекцию")
+
+    return run_image(image, "", weights_preset, weights_custom, conf, iou, imgsz, draw_only_target)
+
+
+def run_camera_snapshot(
+    camera_source: str,
+    weights_preset: str,
+    weights_custom: str,
+    conf: float,
+    iou: float,
+    imgsz: int,
+    draw_only_target: bool,
+):
+    image = capture_frame_from_source(camera_source)
+
+    weights = _resolve_weights(weights_preset, weights_custom)
+
+    annotated, record = predict_image(
+        image,
+        source=f"camera:{camera_source}",
+        weights=weights,
+        conf=conf,
+        iou=iou,
+        imgsz=int(imgsz),
+        target_class_names=DEFAULT_TARGET_CLASS_NAMES,
+        draw_only_target=bool(draw_only_target),
+    )
+
+    xlsx = export_excel(record)
+    pdf = export_pdf(record)
+    record.setdefault("files", {})
+    record["files"]["excel"] = str(Path(xlsx).as_posix())
+    record["files"]["pdf"] = str(Path(pdf).as_posix())
+
+    append_record(record)
+
+    det_df = pd.DataFrame(record.get("detections") or [])
+    return image, annotated, record, det_df, str(xlsx), str(pdf)
+
+
+def run_camera_clip(
+    camera_source: str,
+    seconds: int,
+    weights_preset: str,
+    weights_custom: str,
+    conf: float,
+    iou: float,
+    imgsz: int,
+    frame_stride: int,
+):
+    clip_path = record_clip_from_source(camera_source, seconds=int(seconds))
+
+    weights = _resolve_weights(weights_preset, weights_custom)
+
+    out_video, record = predict_video(
+        clip_path,
+        source=f"camera:{camera_source}",
+        weights=weights,
+        conf=conf,
+        iou=iou,
+        imgsz=int(imgsz),
+        target_class_names=DEFAULT_TARGET_CLASS_NAMES,
+        frame_stride=int(frame_stride),
+    )
+
+    xlsx = export_excel(record)
+    pdf = export_pdf(record)
+    record.setdefault("files", {})
+    record["files"]["excel"] = str(Path(xlsx).as_posix())
+    record["files"]["pdf"] = str(Path(pdf).as_posix())
+
+    append_record(record)
+
+    return str(clip_path), out_video, record, str(xlsx), str(pdf)
 
 
 def run_image(
@@ -236,24 +424,110 @@ def build_app() -> gr.Blocks:
                 )
 
             with gr.Tab("Веб‑камера"):
-                gr.Markdown("Снимок с камеры обрабатывается как изображение.")
-                cam_in = gr.Image(sources=["webcam"], type="pil", label="Веб‑камера")
-                cam_btn = gr.Button("Запустить детекцию", variant="primary")
+                with gr.Tabs():
+                    with gr.Tab("Браузер (WebRTC)"):
+                        gr.Markdown(
+                            """
+                            **Как пользоваться:**
 
-                with gr.Row():
-                    cam_out = gr.Image(type="pil", label="Результат")
-                    cam_record = gr.JSON(label="Запись (history)")
+                            1) Нажми **Click to Access Webcam** и разреши доступ к камере в браузере.
+                            2) Сделай снимок (кадр появится в компоненте).
+                            3) Нажми **Запустить детекцию** (или просто поменяй кадр — детекция выполнится автоматически).
+                            """
+                        )
 
-                cam_det_table = gr.Dataframe(label="Детекции (суда)")
-                with gr.Row():
-                    cam_xlsx = gr.File(label="Excel отчёт")
-                    cam_pdf = gr.File(label="PDF отчёт")
+                        cam_in = gr.Image(sources=["webcam"], type="pil", label="Веб‑камера (кадр)")
 
-                cam_btn.click(
-                    fn=lambda img, *args: run_image(img, "", *args),
-                    inputs=[cam_in, weights_preset, weights_custom, conf, iou, imgsz, draw_only],
-                    outputs=[cam_out, cam_record, cam_det_table, cam_xlsx, cam_pdf],
-                )
+                        with gr.Row():
+                            conf_cam = gr.Slider(0.05, 0.9, value=0.25, step=0.05, label="conf")
+                            iou_cam = gr.Slider(0.05, 0.9, value=0.45, step=0.05, label="iou")
+                            imgsz_cam = gr.Slider(320, 1280, value=640, step=32, label="imgsz")
+                            draw_only_cam = gr.Checkbox(value=True, label="Рисовать только суда (boat)")
+
+                        cam_btn = gr.Button("Запустить детекцию", variant="primary")
+
+                        with gr.Row():
+                            cam_out = gr.Image(type="pil", label="Результат")
+                            cam_record = gr.JSON(label="Запись (history)")
+
+                        cam_det_table = gr.Dataframe(label="Детекции (суда)")
+                        with gr.Row():
+                            cam_xlsx = gr.File(label="Excel отчёт")
+                            cam_pdf = gr.File(label="PDF отчёт")
+
+                        # Автозапуск при смене кадра (удобнее, чем отдельная кнопка)
+                        cam_in.change(
+                            fn=run_webcam_image,
+                            inputs=[cam_in, weights_preset, weights_custom, conf_cam, iou_cam, imgsz_cam, draw_only_cam],
+                            outputs=[cam_out, cam_record, cam_det_table, cam_xlsx, cam_pdf],
+                        )
+                        cam_btn.click(
+                            fn=run_webcam_image,
+                            inputs=[cam_in, weights_preset, weights_custom, conf_cam, iou_cam, imgsz_cam, draw_only_cam],
+                            outputs=[cam_out, cam_record, cam_det_table, cam_xlsx, cam_pdf],
+                        )
+
+                    with gr.Tab("Локальная камера / поток (OpenCV)"):
+                        gr.Markdown(
+                            """
+                            Этот режим — **fallback**, если браузер не даёт доступ к камере.
+
+                            В поле *Источник* можно указать:
+                            - `0` / `1` — индекс локальной камеры
+                            - путь к файлу (например `C:/.../video.mp4`)
+                            - URL потока (RTSP/HTTP)
+                            """
+                        )
+
+                        camera_source = gr.Textbox(
+                            value="0",
+                            label="Источник камеры (OpenCV)",
+                            placeholder="0 / 1 / C:/.../video.mp4 / rtsp://...",
+                        )
+
+                        with gr.Row():
+                            conf_cv = gr.Slider(0.05, 0.9, value=0.25, step=0.05, label="conf")
+                            iou_cv = gr.Slider(0.05, 0.9, value=0.45, step=0.05, label="iou")
+                            imgsz_cv = gr.Slider(320, 1280, value=640, step=32, label="imgsz")
+                            draw_only_cv = gr.Checkbox(value=True, label="Рисовать только суда (boat)")
+
+                        snap_btn = gr.Button("Сделать снимок и обработать", variant="primary")
+
+                        with gr.Row():
+                            cv_in = gr.Image(type="pil", label="Снимок (вход)")
+                            cv_out = gr.Image(type="pil", label="Результат")
+
+                        cv_record = gr.JSON(label="Запись (history)")
+                        cv_det_table = gr.Dataframe(label="Детекции (суда)")
+                        with gr.Row():
+                            cv_xlsx = gr.File(label="Excel отчёт")
+                            cv_pdf = gr.File(label="PDF отчёт")
+
+                        snap_btn.click(
+                            fn=run_camera_snapshot,
+                            inputs=[camera_source, weights_preset, weights_custom, conf_cv, iou_cv, imgsz_cv, draw_only_cv],
+                            outputs=[cv_in, cv_out, cv_record, cv_det_table, cv_xlsx, cv_pdf],
+                        )
+
+                        gr.Markdown("### Клип из камеры (как видео)")
+                        seconds = gr.Slider(1, 10, value=3, step=1, label="Длина клипа (сек)")
+                        stride_cam = gr.Slider(1, 30, value=5, step=1, label="Обрабатывать каждый N‑й кадр")
+                        clip_btn = gr.Button("Записать клип и обработать", variant="primary")
+
+                        with gr.Row():
+                            clip_raw = gr.Video(label="Записанный клип")
+                            clip_out = gr.Video(label="Аннотированное видео")
+
+                        clip_record = gr.JSON(label="Запись (history)")
+                        with gr.Row():
+                            clip_xlsx = gr.File(label="Excel отчёт")
+                            clip_pdf = gr.File(label="PDF отчёт")
+
+                        clip_btn.click(
+                            fn=run_camera_clip,
+                            inputs=[camera_source, seconds, weights_preset, weights_custom, conf_cv, iou_cv, imgsz_cv, stride_cam],
+                            outputs=[clip_raw, clip_out, clip_record, clip_xlsx, clip_pdf],
+                        )
 
             with gr.Tab("История и статистика"):
                 refresh_btn = gr.Button("Обновить")
