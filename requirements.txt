@@ -1,0 +1,13 @@
+ultralytics
+gradio
+opencv-python
+pillow
+numpy
+pandas
+openpyxl
+reportlab
+plotly
+requests
+
+# dev/test
+pytest
