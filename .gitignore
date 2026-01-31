@@ -13,7 +13,7 @@ data/
 .idea/
 .vscode/
 
-# Serena
+# local / cache
 .serena/
 
 # model weights / large artifacts
@@ -22,4 +22,8 @@ data/
 
 # misc
 *.log
+
+# личные документы и генераторы отчётов (не в репо)
+docs/
+SUBMISSION_CHECKLIST.md
 
